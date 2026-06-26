@@ -8,12 +8,14 @@ class Settings(BaseSettings):
 
     MODE: str = "paper"  # "paper" or "live"
     PAPER_BALANCE_USD: float = 1000.0
-    PRIVATE_KEY: str = ""
+    PRIVATE_KEY: str = ""  # hex private key, or derived from a 12/24-word seed phrase
 
-    # Live trading (Polymarket CLOB)
-    CLOB_SIGNATURE_TYPE: int = 0   # 0 = EOA, 1 = Email/Magic proxy, 2 = Browser proxy
-    CLOB_FUNDER: str = ""          # proxy wallet address (required for signature_type 1/2)
+    # Live trading (Polymarket CLOB V2). The wallet is derived from PRIVATE_KEY
+    # (hex key or seed phrase). New wallets trade via the gasless deposit-wallet
+    # flow (POLY_1271); the relayer key sponsors on-chain setup (deploy/approvals).
     CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
+    RELAYER_API_KEY: str = ""          # Polymarket relayer API key (gasless on-chain txs)
+    # The relayer key's owner address is the EOA — derived from PRIVATE_KEY automatically.
 
     # Polymarket on-chain contracts (Polygon) — used for EOA allowance setup
     USDC_ADDRESS: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -34,17 +36,21 @@ class Settings(BaseSettings):
     RISK_TYPE: str = "percent"
     RISK_VALUE: float = 10.0
 
-    # ── Latency-arb entry engine ────────────────────────────────────────────────
-    # Fair probability (fast, from Binance spot) vs Polymarket's implied price.
-    # Enter when EV = fair - ask_price clears EV_THRESHOLD (the book looks stale).
-    EV_THRESHOLD: float = 0.04          # require >= this expected value per $1 share (after price)
-    MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
+    # ── EV price gate ───────────────────────────────────────────────────────────
+    # After HA(5m trend)+HA(1m fresh momentum)+RSI(50) pick the side, EV finds the
+    # price: fair prob (fast, from Binance spot) vs the Polymarket ask on that side.
+    EV_THRESHOLD: float = 0.04          # require fair - ask >= this to enter the trend
+    MIN_PROB_EV: float = 0.55           # trend side's fair prob must be >= this (HA<->price agreement)
     MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
 
-    # Close-and-flip the open position on a strong opposite signal
+    # Entry: 5m HA trend + fresh 1m HA momentum + RSI(50) confirm + EV — all mandatory.
+    # FRESH_MIN/MAX apply ONLY to the 1m HA streak (the momentum leg). Fixed in code.
+    FRESH_MIN: int = 1              # 1m HA streak must be >= this (a started move)
+    FRESH_MAX: int = 6             # ...and <= this (still fresh, not over-extended)
+
+    # Close-and-flip: reverse the position when the entry signal flips to the opposite
+    # side (the decide_entry signal is the confirmation; no conviction/time gate).
     FLIP_ENABLED: bool = False
-    FLIP_MIN_CONVICTION: float = 0.80   # opposite side's adjusted prob must be >= this
-    FLIP_MIN_MINUTES_LEFT: float = 9.0  # and at least this much time left in the window
 
     RSI_PERIOD: int = 14
 
@@ -64,6 +70,10 @@ class Settings(BaseSettings):
     POLYGON_WSS_URLS: List[str] = [url.strip() for url in os.getenv("POLYGON_WSS_URLS", "").split(",") if url.strip()]
     CHAINLINK_BTC_USD_AGGREGATOR: str = os.getenv("CHAINLINK_BTC_USD_AGGREGATOR", "0xc907E116054Ad103354f2D350FD2514433D57F6f")
 
+    # Alchemy — preferred Polygon RPC/WSS when an API key is set (used first, with
+    # the public RPCs kept as fallback). HTTP for reads/allowances, WSS for the feed.
+    ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
+
     CHAINLINK_AGGREGATORS: Dict[str, str] = {
         "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
         "ETH": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
@@ -78,10 +88,29 @@ class Settings(BaseSettings):
         if s.endswith("USDT"): s = s[:-4]
         return self.CHAINLINK_AGGREGATORS.get(s, self.CHAINLINK_BTC_USD_AGGREGATOR)
 
+    def alchemy_rpc_url(self) -> str:
+        # Polygon RPC used ONLY for the on-chain live-trading path (allowance approvals).
+        return f"https://polygon-mainnet.g.alchemy.com/v2/{self.ALCHEMY_API_KEY}" if self.ALCHEMY_API_KEY else ""
+
     # Proxy
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", os.getenv("http_proxy", ""))
     HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", ""))
     ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
+
+def normalize_private_key(secret: str) -> str:
+    """Accept either a raw hex private key or a 12/24-word seed phrase and return a
+    hex private key. EOA only — the wallet is derived from the secret, nothing else.
+    Returns "" for empty input. Raises if a seed phrase can't be parsed."""
+    secret = (secret or "").strip()
+    if not secret:
+        return ""
+    # A mnemonic is several space-separated words; a private key is a single token.
+    if len(secret.split()) >= 12:
+        from eth_account import Account
+        Account.enable_unaudited_hdwallet_features()
+        return Account.from_mnemonic(secret).key.hex()
+    return secret
+
 
 def load_settings():
     base_settings = Settings()
@@ -93,12 +122,11 @@ def load_settings():
 
             if "mode" in config_data: base_settings.MODE = config_data["mode"]
             if "paper_balance_usd" in config_data: base_settings.PAPER_BALANCE_USD = config_data["paper_balance_usd"]
-            if "private_key" in config_data: base_settings.PRIVATE_KEY = config_data["private_key"]
+            if "private_key" in config_data: base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
-            if "live" in config_data:
-                live = config_data["live"]
-                if "signature_type" in live: base_settings.CLOB_SIGNATURE_TYPE = int(live["signature_type"])
-                if "funder" in live: base_settings.CLOB_FUNDER = live["funder"]
+            if "relayer" in config_data:
+                rl = config_data["relayer"]
+                if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
 
             if "polymarket" in config_data:
                 poly = config_data["polymarket"]
@@ -129,14 +157,13 @@ def load_settings():
             if "flip" in config_data:
                 flip = config_data["flip"]
                 if "enabled" in flip: base_settings.FLIP_ENABLED = bool(flip["enabled"])
-                if "min_conviction" in flip: base_settings.FLIP_MIN_CONVICTION = float(flip["min_conviction"])
-                if "min_minutes_left" in flip: base_settings.FLIP_MIN_MINUTES_LEFT = float(flip["min_minutes_left"])
 
             if "chainlink" in config_data:
                 cl = config_data["chainlink"]
                 if "polygon_rpc_url" in cl: base_settings.POLYGON_RPC_URL = cl["polygon_rpc_url"]
                 if "polygon_wss_url" in cl: base_settings.POLYGON_WSS_URL = cl["polygon_wss_url"]
                 if "btc_usd_aggregator" in cl: base_settings.CHAINLINK_BTC_USD_AGGREGATOR = cl["btc_usd_aggregator"]
+                if "alchemy_api_key" in cl: base_settings.ALCHEMY_API_KEY = cl["alchemy_api_key"]
 
         except Exception as e:
             print(f"Warning: Failed to load config.json: {e}")

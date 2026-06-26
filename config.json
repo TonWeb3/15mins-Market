@@ -1,10 +1,9 @@
 {
-  "mode": "paper",
+  "mode": "live",
   "paper_balance_usd": 1000,
   "private_key": "",
-  "live": {
-    "signature_type": 0,
-    "funder": ""
+  "relayer": {
+    "api_key": ""
   },
   "polymarket": {
     "gamma_base_url": "https://gamma-api.polymarket.com",
@@ -30,13 +29,12 @@
     "min_book_liquidity_usd": 20
   },
   "flip": {
-    "enabled": true,
-    "min_conviction": 0.65,
-    "min_minutes_left": 4
+    "enabled": true
   },
   "chainlink": {
     "polygon_rpc_url": "https://polygon.drpc.org",
     "polygon_wss_url": "wss://polygon-bor-rpc.publicnode.com",
-    "btc_usd_aggregator": "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+    "btc_usd_aggregator": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+    "alchemy_api_key": "DfkvQ854X-Kg4-ytU2sG0"
   }
 }
