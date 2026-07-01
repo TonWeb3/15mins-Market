@@ -1,77 +1,92 @@
 from typing import Dict, Any
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Entry engine: 5m HA trend + fresh 1m HA momentum + RSI(50) confirm pick the
-#  DIRECTION; EV (fair vs market ask) finds the price. See decide_entry below.
+#  Entry engine (1-minute only): 1m HA direction + 1m AO + RSI(50) confirm the DIRECTION;
+#  then PRICE-VS-15m-OPEN (persistence) + fair_prob_up agreement + odds-below-cap must all
+#  pass. See decide_entry below.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _no_ev(reason: str) -> Dict[str, Any]:
-    return {"action": "NO_TRADE", "side": None, "phase": "TREND_EV", "strength": "EV", "reason": reason}
+def _no_trade(reason: str) -> Dict[str, Any]:
+    return {"action": "NO_TRADE", "side": None, "phase": "TREND", "strength": "-", "reason": reason}
 
 
 def decide_entry(inputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Trend (5m HA) + fresh momentum (1m HA) set the DIRECTION; EV finds the price.
+    """1m HA direction + 1m AO confirm + RSI(50) confirm the DIRECTION; then the GBM
+    fair probability must agree and pay an edge. Everything is 1-minute — no 5m timeframe.
 
-    - 5m HA colour = the trend. Red -> only DOWN, green -> only UP.
-    - 1m HA must be the SAME colour (momentum aligned with the trend) and its streak
-      must be FRESH: between freshMin and freshMax bars (a new move, 1..6 by default —
-      not a stale, over-extended run).
-    - RSI confirms the trend at the 50 line: >= 50 = uptrend (allows UP), < 50 =
-      downtrend (allows DOWN).
-    - Then EV on that side (fair - ask price) must clear evThreshold, i.e. the book is
-      giving a good price to enter the trend. fair prob must also be >= minProb.
+    - 1m HA colour = the direction. Red -> only DOWN, green -> only UP.
+    - 1m Awesome Oscillator must match by BAR COLOUR: green = rising bar (diff > 0),
+      red = falling/flat (diff <= 0). UP needs AO green, DOWN needs AO red.
+    - RSI(14) confirms at the 50 line: >= 50 = uptrend (UP), < 50 = downtrend (DOWN).
+    - PERSISTENCE: current price must be on the side's side of the 15m window OPEN —
+      UP needs price ABOVE the open, DOWN needs price BELOW (aboveOpen).
+    - fair_prob (mcProbUp) must AGREE on the side: the chosen side's fair prob > 0.5.
+    - PRICE CAP: the chosen side's Polymarket ask must be BELOW `maxPrice` (default 0.60).
 
-    HA, RSI(50) and EV are EQUAL, MANDATORY gates — all three must agree to enter; none
-    overrides another. HA picks WHICH way, RSI(50) confirms it, EV picks WHEN/at what price.
+    All gates are EQUAL and MANDATORY; none overrides another.
     """
-    ha5 = inputs.get("ha5Color")          # "green" / "red" / None  (trend)
-    ha1 = inputs.get("ha1Color")          # "green" / "red" / None  (momentum)
-    streak1 = inputs.get("ha1Streak") or 0
-    p_up = inputs.get("mcProbUp")
+    ha1 = inputs.get("ha1Color")          # "green" / "red" / None  (1m direction)
+    ao1 = inputs.get("ao1")               # "green" / "red" / None  (1m AO confirm)
+    p_up = inputs.get("mcProbUp")         # fair_prob_up (GBM, from 1m)
     price_up = inputs.get("priceUp")
     price_down = inputs.get("priceDown")
-    fresh_min = inputs.get("freshMin", 1)
-    fresh_max = inputs.get("freshMax", 6)
-    min_prob = inputs.get("minProb", 0.55)
-    ev_threshold = inputs.get("evThreshold", 0.04)
+    max_price = inputs.get("maxPrice", 0.60)
 
     if p_up is None:
-        return _no_ev("missing_model_data")
+        return _no_trade("missing_model_data")
     if price_up is None or price_down is None:
-        return _no_ev("missing_prices")
+        return _no_trade("missing_prices")
 
-    # ── TREND (5m HA) ──
-    if ha5 not in ("green", "red"):
-        return _no_ev("no_5m_trend")
-    # ── MOMENTUM (1m HA aligned + fresh) ──
-    if ha1 != ha5:
-        return _no_ev("momentum_not_aligned")
-    if not (fresh_min <= streak1 <= fresh_max):
-        return _no_ev(f"not_fresh_{streak1}")
+    # ── DIRECTION (1m HA) ──
+    if ha1 not in ("green", "red"):
+        return _no_trade("no_1m_trend")
 
-    side = "UP" if ha5 == "green" else "DOWN"
-    p = p_up if side == "UP" else (1.0 - p_up)
+    side = "UP" if ha1 == "green" else "DOWN"
+    p = p_up if side == "UP" else (1.0 - p_up)       # fair prob of the chosen side
     price = price_up if side == "UP" else price_down
-    ev = p - price
+
+    # ── 1m AWESOME OSCILLATOR confirmation by BAR COLOUR — REQUIRED ──
+    # Standard AO histogram: green = rising bar (diff > 0), red = falling/flat (diff <= 0).
+    if ao1 is None:
+        return _no_trade("ao_unavailable")
+    if side == "UP" and ao1 != "green":
+        return _no_trade("ao1_not_green")
+    if side == "DOWN" and ao1 != "red":
+        return _no_trade("ao1_not_red")
 
     # ── RSI trend confirmation at the 50 line (>=50 up, <50 down) — REQUIRED ──
     rsi = inputs.get("rsi")
     if rsi is None:
-        return _no_ev("rsi_unavailable")
+        return _no_trade("rsi_unavailable")
     if side == "UP" and rsi < 50:
-        return _no_ev(f"rsi_{rsi:.0f}_not_uptrend")
+        return _no_trade(f"rsi_{rsi:.0f}_not_uptrend")
     if side == "DOWN" and rsi >= 50:
-        return _no_ev(f"rsi_{rsi:.0f}_not_downtrend")
+        return _no_trade(f"rsi_{rsi:.0f}_not_downtrend")
 
-    # ── EV gate: good price to enter the trend ──
-    if p < min_prob:
-        return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}")
-    if ev < ev_threshold:
-        return _no_ev(f"ev_{ev:.3f}_below_{ev_threshold:.3f}")
+    # ── PERSISTENCE: price must be on the right side of the 15m window OPEN ──
+    # aboveOpen = current price > the window's (Chainlink) open. UP needs it above,
+    # DOWN needs it below — only trade the side that is currently "winning" the bet.
+    above_open = inputs.get("aboveOpen")
+    if above_open is None:
+        return _no_trade("open_unavailable")
+    if side == "UP" and not above_open:
+        return _no_trade("price_below_open")
+    if side == "DOWN" and above_open:
+        return _no_trade("price_above_open")
+
+    # ── fair_prob DIRECTION AGREEMENT: model must favour the side the indicators picked ──
+    if p <= 0.5:
+        return _no_trade(f"fair_{p:.2f}_disagrees")
+
+    # ── PRICE CAP: only enter when the odds are below the cap ──
+    if price is None:
+        return _no_trade("no_price")
+    if price >= max_price:
+        return _no_trade(f"price_{price:.2f}_above_{max_price:.2f}")
 
     strength = "HIGH_CONVICTION" if p >= 0.70 else "STRONG"
     return {
-        "action": "ENTER", "side": side, "phase": "TREND_EV", "strength": strength,
-        "prob": p, "price": price, "ev": ev, "streak": streak1, "reason": "trend_momentum_ev"
+        "action": "ENTER", "side": side, "phase": "TREND", "strength": strength,
+        "prob": p, "price": price, "reason": "trend_confirmed"
     }

@@ -2,6 +2,7 @@ import asyncio
 import time
 import json
 import os
+import math
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -21,6 +22,19 @@ from bot.clob_trader import clob_trader
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Silence aiohttp's harmless "Unclosed client session" noise at shutdown (sessions
+    # are closed below; this is a safety net for any straggler collected during GC).
+    try:
+        _loop = asyncio.get_running_loop()
+        _prev_handler = _loop.get_exception_handler()
+        def _quiet_handler(loop, context):
+            if context.get("message") == "Unclosed client session":
+                return
+            (_prev_handler(loop, context) if _prev_handler else loop.default_exception_handler(context))
+        _loop.set_exception_handler(_quiet_handler)
+    except Exception:
+        pass
+
     # Load previous state
     load_state()
 
@@ -31,7 +45,6 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(binance_stream.start()),
         asyncio.create_task(binance_kline_1m.start()),
-        asyncio.create_task(binance_kline_5m.start()),
         asyncio.create_task(polymarket_ws_stream.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop())
@@ -39,15 +52,28 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown cleanup
-    for task in tasks:
-        task.cancel()
-
+    # Shutdown: signal the streams to stop, cancel their tasks, then AWAIT each task so it
+    # unwinds its `async with aiohttp.ClientSession()` and closes the session cleanly.
+    # (Cancelling without awaiting leaves sessions open -> aiohttp's "Unclosed client
+    # session" warning at garbage-collection.)
     binance_stream.close()
     binance_kline_1m.close()
-    binance_kline_5m.close()
     polymarket_ws_stream.close()
     chainlink_ws_stream.close()
+
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except BaseException:
+            pass  # CancelledError / timeout on shutdown — ignore
+
+    # Close the web3 Chainlink RPC sessions (created by chainlink_fetcher).
+    try:
+        await chainlink.chainlink_fetcher.aclose()
+    except Exception:
+        pass
 
 app = FastAPI(title="Polymarket BTC 15m Assistant", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
@@ -64,8 +90,18 @@ state = {
     "last_trade_side": None,
     "last_balance_refresh": 0,
     "running": False,  # trading is off until the user presses Start on the dashboard
-    "window_marks": {}  # market_id -> {open, open_ts, last, last_ts}: Chainlink 15m open/close
+    "window_marks": {},  # market_id -> {open, open_ts, last, last_ts}: Chainlink 15m open/close
+    "entered_markets": []  # market_ids already traded — ONE fresh entry per 15m window (flips excepted)
 }
+
+def _mark_window_entered(market_id):
+    """Record that a window (market) has had a position, so it can't be re-entered this
+    15m window (one entry per window). Bounded to the most recent 100."""
+    mid = str(market_id)
+    if mid not in state["entered_markets"]:
+        state["entered_markets"].append(mid)
+        if len(state["entered_markets"]) > 100:
+            state["entered_markets"].pop(0)
 
 def save_state():
     try:
@@ -74,7 +110,8 @@ def save_state():
             "active_trades": state["active_trades"],
             "trade_history": state["trade_history"],
             "last_trade_side": state["last_trade_side"],
-            "window_marks": state["window_marks"]
+            "window_marks": state["window_marks"],
+            "entered_markets": state["entered_markets"]
         }
         with open("state_data.json", "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -98,6 +135,7 @@ def load_state():
                 state["trade_history"] = loaded.get("trade_history", [])
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["window_marks"] = loaded.get("window_marks", {})
+                state["entered_markets"] = loaded.get("entered_markets", [])
                 log_message("State loaded from state_data.json")
     except Exception as e:
         print(f"Error loading state: {e}")
@@ -116,10 +154,26 @@ def get_ws_symbol_filter(symbol: str) -> str:
         return s[:-4].lower()
     return s.lower()
 
+def merge_live_close(klines: List[Dict], spot: Optional[float]) -> List[Dict]:
+    """Fold the live @trade websocket tick into the forming (last) candle so the
+    indicators (HA, RSI, AO) update in real time between the slower kline-WS pushes.
+    Returns a shallow copy with the last candle's close set to `spot` and its high/low
+    extended; the shared WS buffer is NOT mutated."""
+    if not klines or spot is None:
+        return klines
+    out = list(klines)
+    last = dict(out[-1])
+    last["close"] = spot
+    if last.get("high") is not None:
+        last["high"] = max(last["high"], spot)
+    if last.get("low") is not None:
+        last["low"] = min(last["low"], spot)
+    out[-1] = last
+    return out
+
 # Background task instances
 binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL)
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
-binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
 
 polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
@@ -225,23 +279,78 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     }
 
 async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None):
-    # Regular entry from decision engine. Returns a short reason string describing
-    # the outcome (entered / which gate vetoed it) for diagnostic logging.
+    # Entry from the decision engine. If a RUNNING position in THIS market is on the
+    # OPPOSITE side of a new ENTER signal, FLIP it (close the held side, then open the
+    # new one) so a fresh opposite signal is never blocked. Returns a short reason string.
     if decision["action"] != "ENTER":
         return decision.get("reason", "no_trade")
-
-    # CONSTRAINT: one *running* position at a time. A trade whose 15m window has
-    # already ended (now only awaiting Polymarket's resolution) no longer blocks a new
-    # entry — the next market is already live, so we can trade it while the old one
-    # settles in the background.
+    side = decision["side"]
     now_ts = time.time()
+
+    # The currently-RUNNING position in THIS market (if any).
+    running_here = next((t for t in state["active_trades"]
+                         if str(t.get("market_id")) == str(market.get("id"))
+                         and now_ts < (t.get("end_ts") or float("inf"))), None)
+    if running_here is not None:
+        if running_here["side"] == side:
+            return "already_in_position"            # already on the signalled side
+        if not settings.FLIP_ON_SIGNAL_ENABLED:
+            return "hold_opposite"                  # flip disabled — hold the position to expiry
+        # Opposite signal -> close the held side, then open the new one (flip). This is
+        # the ONE exception to "one entry per window" (it requires a held opposite side).
+        if not await _close_position(running_here, market_prices, token_ids, orderbook, "signal_flip"):
+            return "flip_close_failed"
+        log_message(f"FLIP on new signal: {running_here['side']} -> {side}")
+    else:
+        # FRESH entry — ONE per 15m window. If this window already had a position (incl.
+        # one closed early on a 1m reversal), block re-entry until the next market.
+        if str(market.get("id")) in state["entered_markets"]:
+            return "window_done"
+
+    # CONSTRAINT: one *running* position at a time. A trade whose 15m window has already
+    # ended (only awaiting Polymarket's resolution) no longer blocks a new entry — the next
+    # market is already live, so we can trade it while the old one settles in the background.
     if any(now_ts < (t.get("end_ts") or float("inf")) for t in state["active_trades"]):
         return "slot_busy"
     # Never hold two positions in the same market (running or still settling).
     if any(str(t.get("market_id")) == str(market.get("id")) for t in state["active_trades"]):
         return "market_busy"
 
-    return await _open_position(decision["side"], market_prices, market, target_open, token_ids, orderbook)
+    return await _open_position(side, market_prices, market, target_open, token_ids, orderbook)
+
+
+async def _close_position(trade: Dict[str, Any], market_prices: Optional[Dict[str, Any]], token_ids: Optional[Dict[str, Any]], orderbook: Optional[Dict[str, Any]], reason: str) -> bool:
+    """Sell out of `trade`, book its P/L and move it to history. Returns True on success,
+    False if it couldn't be closed (no exit price / live sell failed). Used by both the
+    new-signal flip and the close-on-1m-reversal."""
+    held_key = "up" if trade["side"] == "UP" else "down"
+    ob = (orderbook or {}).get(held_key) or {}
+    exit_price = ob.get("bestBid") or (market_prices or {}).get(held_key)
+    if not exit_price or exit_price <= 0:
+        log_message(f"Close aborted ({reason}): no exit price for {trade['side']}")
+        return False
+
+    if state["trading_mode"] == "live":
+        token_id = (token_ids or {}).get(held_key)
+        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
+        if not result.get("ok"):
+            log_message(f"Close sell FAILED ({reason}, {trade['side']}): {result.get('error')}")
+            return False
+        # live balance is refreshed from chain elsewhere
+    else:
+        state["paper_balance"] += trade["shares"] * exit_price  # proceeds from selling out
+
+    trade["status"] = "CLOSED"
+    trade["exit_time"] = datetime.now().isoformat()
+    trade["exit_reason"] = reason
+    trade["settlement_price_at_expiry"] = exit_price
+    trade["profit_loss"] = (trade["shares"] * exit_price) - trade["amount"]
+    state["trade_history"].append(trade)
+    state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
+    state["last_trade_side"] = None
+    save_state()
+    log_message(f"CLOSE ({reason}): {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f})")
+    return True
 
 
 async def _open_position(side: str, market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None):
@@ -253,8 +362,7 @@ async def _open_position(side: str, market_prices: Dict[str, Any], market: Dict[
         return "no_price"
 
     # ── Risk per trade ──────────────────────────────────────────────────────────
-    # No flat price cap (EV already governs reward/risk). RISK_TYPE selects how the
-    # stake (the dollars put at risk) is sized:
+    # RISK_TYPE selects how the stake (the dollars put at risk) is sized:
     #   "percent" -> RISK_VALUE% of the current balance
     #   "fixed"   -> RISK_VALUE dollars, flat
     balance = state["paper_balance"]
@@ -312,6 +420,7 @@ async def _open_position(side: str, market_prices: Dict[str, Any], market: Dict[
         state["paper_balance"] -= amount_to_risk
         state["active_trades"].append(trade)
         state["last_trade_side"] = side
+        _mark_window_entered(market["id"])
         save_state()
 
         log_message(f"Executed PAPER trade: {side} @ {price} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})")
@@ -333,6 +442,7 @@ async def _open_position(side: str, market_prices: Dict[str, Any], market: Dict[
             trade["order_response"] = resp
             state["active_trades"].append(trade)
             state["last_trade_side"] = side
+            _mark_window_entered(market["id"])
             save_state()
             log_message(f"Executed LIVE trade: {side} ${amount_to_risk:.2f} on {market.get('slug')} (order {order_id})")
             return "entered"
@@ -340,63 +450,45 @@ async def _open_position(side: str, market_prices: Dict[str, Any], market: Dict[
             log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
             return "live_order_failed"
 
-async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], target_open: float):
-    """Flip the running position the instant the ENTRY signal flips to the opposite side.
-    The decide_entry signal itself (5m HA trend + fresh 1m momentum + RSI(50) + EV) IS the
-    confirmation — NO conviction or time-left gate; a flip can fire anytime in the window.
-    FLIP_ENABLED is the only switch.
+async def maybe_close_on_reversal(ha1_color: Optional[str], ha1_count: Optional[int], ao1_color: Optional[str], ao1_count: Optional[int], poly_snapshot: Dict[str, Any]):
+    """CLOSE a running position (do NOT reverse) when the 1m HA and the 1m AO BOTH flip
+    against it AND each has held the reversal colour for >= CLOSE_REVERSAL_BARS bars
+    (default 3). E.g. holding UP, when both the 1m HA and 1m AO have been red for >=3 bars
+    -> sell the UP and go flat. The bar requirement avoids closing on a single-bar flicker.
+    This only CLOSES the position — it never opens the opposite side.
+
+    CLOSE_ON_REVERSAL_ENABLED is the master switch.
     """
-    if not settings.FLIP_ENABLED:
+    if not settings.CLOSE_ON_REVERSAL_ENABLED:
         return
-    if decision.get("action") != "ENTER" or not state["active_trades"]:
+    if not state["active_trades"]:
         return
-    new_side = decision["side"]
+    if ha1_color not in ("green", "red") or ao1_color not in ("green", "red"):
+        return
 
     market = poly_snapshot["market"]
-    prices = poly_snapshot["prices"]
-    token_ids = poly_snapshot.get("token_ids", {})
-    orderbook = poly_snapshot.get("orderbook", {})
 
-    # Flip only the currently-RUNNING position in THIS market. Trades from past
-    # markets that are merely awaiting resolution are left alone to settle.
+    # Only the currently-RUNNING position in THIS market. Trades from past markets that
+    # are merely awaiting resolution are left alone to settle.
     now_ts = time.time()
     trade = next((t for t in state["active_trades"]
                   if str(t.get("market_id")) == str(market.get("id"))
                   and now_ts < (t.get("end_ts") or float("inf"))), None)
-    if trade is None or trade["side"] == new_side:
-        return  # nothing running here, or already on the signalled side
-
-    held_key = "up" if trade["side"] == "UP" else "down"
-    ob = orderbook.get(held_key) or {}
-    exit_price = ob.get("bestBid") or prices.get(held_key)
-    if not exit_price or exit_price <= 0:
-        log_message(f"FLIP aborted: no exit price for {trade['side']}")
+    if trade is None:
         return
 
-    if state["trading_mode"] == "live":
-        token_id = token_ids.get(held_key)
-        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
-        if not result.get("ok"):
-            log_message(f"FLIP sell FAILED ({trade['side']}): {result.get('error')}")
-            return
-        # live balance is refreshed from chain elsewhere
-    else:
-        state["paper_balance"] += trade["shares"] * exit_price  # proceeds from selling out
+    # Reversal colour = opposite of the held side. Both 1m HA AND 1m AO must show it,
+    # each for at least CLOSE_REVERSAL_BARS consecutive bars (confirmed, not a flicker).
+    reversal = "red" if trade["side"] == "UP" else "green"
+    bars = settings.CLOSE_REVERSAL_BARS
+    if ha1_color != reversal or ao1_color != reversal:
+        return  # not a 1m reversal (HA + AO) against the held side
+    if (ha1_count or 0) < bars or (ao1_count or 0) < bars:
+        return  # reversal not yet confirmed for >= bars on both 1m HA and 1m AO
 
-    trade["status"] = "CLOSED"
-    trade["exit_time"] = datetime.now().isoformat()
-    trade["exit_reason"] = "flip"
-    trade["settlement_price_at_expiry"] = exit_price
-    trade["profit_loss"] = (trade["shares"] * exit_price) - trade["amount"]
-    state["trade_history"].append(trade)
-    state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
-    state["last_trade_side"] = None
-    save_state()
-    log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side}")
-
-    # Open the opposite side immediately — the slot is now free.
-    open_result = await _open_position(new_side, prices, market, target_open, token_ids, orderbook)
-    log_message(f"FLIP: open {new_side} -> {open_result}")
+    # Close only — never open the opposite side.
+    await _close_position(trade, poly_snapshot.get("prices"), poly_snapshot.get("token_ids", {}),
+                          poly_snapshot.get("orderbook", {}), "reversal_close")
 
 async def update_trades(current_prices: Dict[str, Any]):
     remaining_active = []
@@ -551,21 +643,16 @@ async def update_trades(current_prices: Dict[str, Any]):
 
 async def seed_kline_buffers():
     try:
-        k1m, k5m = await asyncio.gather(
-            data.fetch_klines(settings.SYMBOL, "1m", 240),
-            data.fetch_klines(settings.SYMBOL, "5m", 200)
-        )
+        k1m = await data.fetch_klines(settings.SYMBOL, "1m", 240)
         binance_kline_1m.set_candles(k1m)
-        binance_kline_5m.set_candles(k5m)
-        log_message(f"Seeded Binance kline buffers (1m/5m) for {settings.SYMBOL}")
+        log_message(f"Seeded Binance 1m kline buffer for {settings.SYMBOL}")
     except Exception as e:
         log_message(f"Failed to seed kline buffers: {e}")
 
 async def update_loop():
     csv_header = [
         "timestamp", "entry_minute", "time_left_min", "signal",
-        "model_up", "model_down", "mkt_up", "mkt_down", "edge_up", "edge_down",
-        "recommendation", "reason", "exec_result"
+        "mkt_up", "mkt_down", "recommendation", "reason", "exec_result"
     ]
 
     while True:
@@ -591,31 +678,22 @@ async def update_loop():
             chainlink_data = results[1] if not isinstance(results[1], Exception) else {}
             poly_snapshot = results[2] if not isinstance(results[2], Exception) else {"ok": False}
 
-            klines_1m = binance_kline_1m.get_candles()
-            klines_5m = binance_kline_5m.get_candles()
-
             spot_price = binance_ws.get("price") if binance_ws and binance_ws.get("price") else last_price
 
-            mc_steps = max(1, __import__('math').ceil(timing["remainingMinutes"] / 5))
+            # Fold the live @trade websocket tick into the forming 1m candle so the
+            # indicators (HA, RSI, AO) are computed in real time off live data, not just
+            # on the slower kline-WS candle pushes.
+            klines_1m = merge_live_close(binance_kline_1m.get_candles(), spot_price)
 
+            # Window open price (the strike) — recorded on each trade for reference.
+            # The 15m window start is also a 1m boundary, so take the 1m candle at it.
             target_open = spot_price
-            if klines_5m:
+            if klines_1m:
                 start_ms = timing["startMs"]
-                for c in reversed(klines_5m):
+                for c in reversed(klines_1m):
                     if c["openTime"] <= start_ms:
                         target_open = c["open"]
                         break
-
-            # Fast closed-form fair probability (the EV "fair" side, from Binance spot).
-            drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
-            fair_data = {
-                "prob_up": fair_up,
-                "prob_down": 1.0 - fair_up,
-                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
-                "sigma_5m": sigma_5m,
-            }
 
             current_price = None
             price_source = None
@@ -660,43 +738,55 @@ async def update_loop():
             closes = [c["close"] for c in klines_1m]
             rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
 
-            # Heiken-Ashi streaks: 5m = trend, 1m = fresh momentum (used by decide_entry).
+            # 1m Heiken-Ashi streak {color, count} — the direction (used by decide_entry).
             consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m))
-            consec_5m = {"color": None, "count": 0}
-            if len(klines_5m) >= 20:
-                consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
+
+            # 1m Awesome Oscillator — {value, color, count}. color = AO bar colour
+            # (green = rising bar, red = falling/flat). Decision uses the colour; count is
+            # a display streak (shown like the HA).
+            ao_1m = indicators.compute_awesome_oscillator(klines_1m)
+
+            # GBM fair probability (closed-form, from 1m): P(close above the window open).
+            # steps = minutes left (each 1m candle is one step); drift/vol from 1m candles.
+            steps_1m = max(1, math.ceil(max(0.0, timing["remainingMinutes"])))
+            drift_1m, sigma_1m = indicators.realized_drift_vol(klines_1m, lookback=240)
+            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, steps_1m, sigma_1m, drift_per_step=drift_1m or 0.0)
+            fair_data = {
+                "prob_up": fair_up, "prob_down": 1.0 - fair_up,
+                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
+            }
 
             market_up = poly_snapshot["prices"]["up"] if poly_snapshot["ok"] else None
             market_down = poly_snapshot["prices"]["down"] if poly_snapshot["ok"] else None
 
-            # ── LATENCY EDGE ─────────────────────────────────────────────────────
-            # Our fast Binance-derived fair prob vs the market's (possibly stale)
-            # implied prob. A positive edge = the book hasn't repriced the move yet.
-            market_implied_up = None
-            if market_up is not None and market_down is not None and (market_up + market_down) > 0:
-                market_implied_up = market_up / (market_up + market_down)
-            edge = {
-                "marketUp": market_implied_up,
-                "marketDown": (1 - market_implied_up) if market_implied_up is not None else None,
-                "edgeUp": (fair_up - market_implied_up) if market_implied_up is not None else None,
-                "edgeDown": ((1 - fair_up) - (1 - market_implied_up)) if market_implied_up is not None else None,
-            }
-            prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
+            # ── PERSISTENCE: current price vs the 15m window OPEN. above => UP bias, below
+            # => DOWN bias. Prefer the CHAINLINK open (what Polymarket settles on) — but
+            # ONLY when it was actually snapshotted at the window start (open_ts near the
+            # start). On a fresh / mid-window start that Chainlink open is missing or wrong,
+            # so fall back to the BINANCE 1m window open (`target_open`, always available
+            # from the seeded klines). Each branch compares SAME feed = no cross-feed offset.
+            window_open = None
+            above_open = None
+            open_source = None
+            if poly_snapshot.get("ok"):
+                _wm = state["window_marks"].get(str(poly_snapshot["market"].get("id"))) or {}
+                _start_sec = timing["startMs"] / 1000.0
+                _cl_open, _cl_open_ts = _wm.get("open"), _wm.get("open_ts")
+                if _cl_open and _cl_open_ts and _cl_open_ts <= _start_sec + 60 and current_price:
+                    window_open, above_open, open_source = _cl_open, (current_price > _cl_open), "chainlink"
+                elif target_open and spot_price:
+                    window_open, above_open, open_source = target_open, (spot_price > target_open), "binance"
 
-            # ── ENTRY: 5m HA trend + fresh 1m HA momentum set DIRECTION; EV finds price ──
-            # 5m HA colour = trend (red->DOWN, green->UP). 1m HA must match it and be a
-            # FRESH streak (freshMin..freshMax bars). RSI(50) confirms. EV picks the price.
+            # ── ENTRY (1m only): 1m HA direction + 1m AO + RSI(50) + price-vs-open ──
+            # ── (persistence) + fair_prob agreement + odds < cap. (No EV gate.)      ──
             decision = engines.decide_entry({
-                "ha5Color": consec_5m["color"],          # 5m trend
-                "ha1Color": consec["color"],             # 1m momentum
-                "ha1Streak": consec["count"],
-                "mcProbUp": fair_up,
+                "ha1Color": consec["color"],             # 1m HA = direction
+                "ao1": ao_1m["color"],                   # 1m AO bar colour (rising=green)
+                "mcProbUp": fair_up,                     # GBM fair prob (direction agreement)
+                "aboveOpen": above_open,                 # price vs 15m window open (persistence)
                 "priceUp": market_up,
                 "priceDown": market_down,
-                "minProb": settings.MIN_PROB_EV,
-                "evThreshold": settings.EV_THRESHOLD,
-                "freshMin": settings.FRESH_MIN,
-                "freshMax": settings.FRESH_MAX,
+                "maxPrice": settings.MAX_ENTRY_PRICE,    # only buy when odds < this
                 "rsi": rsi_now,
             })
 
@@ -706,8 +796,11 @@ async def update_loop():
             # and the dashboard keep updating regardless so the balance view stays live.
             exec_result = None
             if poly_snapshot["ok"] and state["running"]:
-                await maybe_flip_position(decision, poly_snapshot, target_open)
+                # execute_trade FIRST so a full opposite signal FLIPS the position (the
+                # one exception to one-entry-per-window). Then the reversal-close handles a
+                # 1m HA+AO reversal as an exit-only (and the window stays locked after).
                 exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], target_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}))
+                await maybe_close_on_reversal(consec["color"], consec["count"], ao_1m["color"], ao_1m["count"], poly_snapshot)
             elif not state["running"]:
                 exec_result = "stopped"
 
@@ -726,8 +819,8 @@ async def update_loop():
             signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
             utils.append_csv_row("./logs/signals.csv", csv_header, [
                 datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
-                signal_label, fair_up, 1 - fair_up, market_up, market_down,
-                edge["edgeUp"], edge["edgeDown"], f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
+                signal_label, market_up, market_down,
+                f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
                 decision.get("reason", ""), exec_result or ""
             ])
 
@@ -754,11 +847,12 @@ async def update_loop():
                 "indicators": {
                     "rsi": rsi_now,
                     "heiken": consec,
-                    "heiken_5m": consec_5m,
-                    "fair": fair_data
+                    "ao": {"m1": ao_1m},
+                    "fair": fair_data,
+                    "vs_open": {"window_open": window_open, "above_open": above_open, "source": open_source}
                 },
                 "analysis": {
-                    "probability": prob_view, "edge": edge, "decision": decision
+                    "decision": decision
                 }
             }
             state["last_update_ts"] = time.time()
@@ -817,19 +911,22 @@ async def get_settings():
             "risk_type": settings.RISK_TYPE,
             "risk_value": settings.RISK_VALUE
         },
-        "ev": {
-            "ev_threshold": settings.EV_THRESHOLD,
-            "min_prob": settings.MIN_PROB_EV,
+        "entry": {
+            "max_price": settings.MAX_ENTRY_PRICE,
             "min_book_liquidity_usd": settings.MIN_BOOK_LIQUIDITY_USD
         },
-        "flip": {
-            "enabled": settings.FLIP_ENABLED
+        "flip_on_signal": {
+            "enabled": settings.FLIP_ON_SIGNAL_ENABLED
+        },
+        "close_on_reversal": {
+            "enabled": settings.CLOSE_ON_REVERSAL_ENABLED,
+            "bars": settings.CLOSE_REVERSAL_BARS
         }
     }
 
 @app.post("/api/settings")
 async def post_settings(new_settings: Dict[str, Any]):
-    global binance_stream, polymarket_ws_stream, chainlink_ws_stream, binance_kline_1m, binance_kline_5m
+    global binance_stream, polymarket_ws_stream, chainlink_ws_stream, binance_kline_1m
     old_symbol = settings.SYMBOL
 
     # Credential may be a hex private key OR a 12/24-word seed phrase. We persist
@@ -877,16 +974,22 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.RISK_TYPE = t.get("risk_type", settings.RISK_TYPE)
         settings.RISK_VALUE = float(t.get("risk_value", settings.RISK_VALUE))
 
-    if "ev" in new_settings:
-        e = new_settings["ev"]
-        settings.EV_THRESHOLD = float(e.get("ev_threshold", settings.EV_THRESHOLD))
-        settings.MIN_PROB_EV = float(e.get("min_prob", settings.MIN_PROB_EV))
-        settings.MIN_BOOK_LIQUIDITY_USD = float(e.get("min_book_liquidity_usd", settings.MIN_BOOK_LIQUIDITY_USD))
+    if "entry" in new_settings:
+        en = new_settings["entry"]
+        settings.MAX_ENTRY_PRICE = float(en.get("max_price", settings.MAX_ENTRY_PRICE))
+        settings.MIN_BOOK_LIQUIDITY_USD = float(en.get("min_book_liquidity_usd", settings.MIN_BOOK_LIQUIDITY_USD))
 
-    if "flip" in new_settings:
-        f = new_settings["flip"]
-        if "enabled" in f:
-            settings.FLIP_ENABLED = bool(f["enabled"])
+    if "flip_on_signal" in new_settings:
+        fos = new_settings["flip_on_signal"]
+        if "enabled" in fos:
+            settings.FLIP_ON_SIGNAL_ENABLED = bool(fos["enabled"])
+
+    if "close_on_reversal" in new_settings:
+        c = new_settings["close_on_reversal"]
+        if "enabled" in c:
+            settings.CLOSE_ON_REVERSAL_ENABLED = bool(c["enabled"])
+        if "bars" in c:
+            settings.CLOSE_REVERSAL_BARS = int(c["bars"])
 
     if "polymarket" in new_settings:
         p = new_settings["polymarket"]
@@ -921,10 +1024,6 @@ async def post_settings(new_settings: Dict[str, Any]):
         binance_kline_1m.close()
         binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
         asyncio.create_task(binance_kline_1m.start())
-
-        binance_kline_5m.close()
-        binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
-        asyncio.create_task(binance_kline_5m.start())
 
         await seed_kline_buffers()
 
